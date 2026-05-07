@@ -13,7 +13,7 @@
         "@react-router/serve": "7.14.0",
         "isbot": "^5.1.36",
         "qrcode.react": "^4.2.0",
-        "react": "^19.2.4",
+        "react": "^19.2.6",
         "react-dom": "^19.2.4",
         "react-router": "7.14.0"
     },
