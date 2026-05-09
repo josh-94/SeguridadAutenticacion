@@ -1,0 +1,68 @@
+# ============================================================
+# ZAP Alert Filter – Reglas para este proyecto Spring Boot
+# Formato: alertId <TAB> accion <TAB> descripcion (opcional)
+#
+# Acciones disponibles:
+#   IGNORE  – suprimir la alerta completamente
+#   WARN    – reportar como advertencia (no falla el pipeline)
+#   FAIL    – falla el pipeline si se encuentra
+#
+# Referencia de IDs: https://www.zaproxy.org/docs/alerts/
+# ============================================================
+
+# --- Suprimidas: no aplican a entorno de desarrollo/test HTTP ---
+
+# HSTS no aplica en HTTP local (solo HTTPS en produccion)
+10035	IGNORE	Strict-Transport-Security Header Not Set (HTTP en test)
+
+# Cache-control en APIs REST con JWT es aceptable controlado por cliente
+10015	IGNORE	Incomplete or No Cache-control Header Set (APIs REST)
+
+# X-Frame-Options no aplica a APIs JSON puras
+10020	IGNORE	X-Frame-Options Header Not Set (API JSON, no HTML)
+
+# Base64 en respuestas: JWT usa base64, es esperado
+10094	IGNORE	Base64 Disclosure (JWT usa base64url)
+
+# Timestamps en logs/audit son intencionales en este proyecto
+10096	IGNORE	Timestamp Disclosure (audit logs intencionales)
+
+# User-Agent fuzzing: no relevante para APIs con JWT
+10104	IGNORE	User Agent Fuzzer
+
+# Espectre/isolation: no aplica a API backend sin JS
+90004	IGNORE	Insufficient Site Isolation Against Spectre Vulnerability
+
+# Cookies: el proyecto usa JWT en header, no cookies de sesion
+10054	IGNORE	Cookie Without SameSite Attribute (no usa cookies de sesion)
+10011	IGNORE	Cookie Without Secure Flag (no usa cookies de sesion)
+
+
+# --- Advertencias: problemas reales pero no bloqueantes en ejercicio ---
+
+# Content-Security-Policy ausente: relevante si se sirve HTML
+10038	WARN	Content Security Policy (CSP) Header Not Set
+
+# X-Content-Type-Options: buena practica, implementar en SecurityConfig
+10021	WARN	X-Content-Type-Options Header Missing
+
+# Permissions-Policy: buena practica para el frontend
+10063	WARN	Permissions Policy Header Not Set
+
+# Info disclosure en headers del servidor (ej: X-Powered-By)
+10024	WARN	Information Disclosure - Sensitive Information in URL
+10027	WARN	Information Disclosure - Suspicious Comments
+
+
+# --- Criticas: fallan el pipeline si se encuentran ---
+
+# Estas NO deben aparecer. Si ZAP las detecta, es un bug real:
+# 40012 = Cross Site Scripting (Reflected)
+# 40014 = Cross Site Scripting (Persistent)
+# 40018 = SQL Injection
+# 40019 = SQL Injection (MySQL)
+# 40020 = SQL Injection (Hypersonic SQL)
+# 40021 = SQL Injection (Oracle)
+# 90020 = Remote OS Command Injection
+# (No se listan aqui porque FAIL es el comportamiento por defecto
+#  para alertas no mencionadas cuando se usa -l FAIL)

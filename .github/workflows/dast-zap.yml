@@ -1,0 +1,296 @@
+name: DAST – OWASP ZAP Security Scan
+
+# ============================================================
+# Estrategia de ejecucion:
+#   Pull Request  → Job 1: Baseline (pasivo, ~3 min)
+#   Push a main   → Job 2: Active Scan (con JWT, ~10 min)
+#   Cron semanal  → Job 2: Active Scan completo
+# ============================================================
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    - cron: "0 3 * * 1"  # Lunes 3am UTC
+
+env:
+  BACKEND_URL: http://localhost:8080
+  # Credenciales de prueba definidas en V2__seed.sql
+  # En produccion real usar secrets: ${{ secrets.ZAP_TEST_USER }}
+  ZAP_TEST_USER: admin
+  ZAP_TEST_PASS: "Admin123!"
+
+jobs:
+
+  # ============================================================
+  # JOB 1: ESCANEO PASIVO (Baseline)
+  # Se ejecuta en Pull Requests para detectar problemas rapido.
+  # No hace ataques: solo analiza headers, cookies y respuestas.
+  # Detecta: CORS mal configurado, headers de seguridad ausentes,
+  #          informacion expuesta, cookies sin flags seguros.
+  # ============================================================
+  zap-baseline:
+    name: "ZAP Baseline (pasivo – PR)"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: tecsup_security
+          POSTGRES_USER: tecsup
+          POSTGRES_PASSWORD: tecsup123
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Configurar Java 17"
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+          cache: maven
+
+      - name: "Compilar backend (sin tests)"
+        working-directory: security
+        run: mvn -B -q package -DskipTests
+
+      - name: "Iniciar backend Spring Boot"
+        working-directory: security
+        run: |
+          java -jar target/security-1.0.0.jar \
+            --spring.datasource.url=jdbc:postgresql://localhost:5433/tecsup_security \
+            --spring.datasource.username=tecsup \
+            --spring.datasource.password=tecsup123 \
+            > /tmp/backend.log 2>&1 &
+          echo $! > /tmp/backend.pid
+          echo "Backend PID: $(cat /tmp/backend.pid)"
+
+      - name: "Esperar que el backend responda"
+        run: |
+          echo "Verificando $BACKEND_URL/v3/api-docs ..."
+          for i in $(seq 1 30); do
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" "$BACKEND_URL/v3/api-docs" || echo "000")
+            if [ "$HTTP" != "000" ]; then
+              echo "Backend listo – respuesta HTTP $HTTP"
+              exit 0
+            fi
+            echo "  Intento $i/30 (esperando 3s)..."
+            sleep 3
+          done
+          echo "ERROR: Backend no respondio en 90 segundos"
+          cat /tmp/backend.log
+          exit 1
+
+      # Escaneo pasivo: ZAP rastrea la app pero NO lanza ataques.
+      # fail_action=false: no falla el pipeline, solo genera reporte.
+      # cmd_options -a: incluye spider Ajax (para SPA si hubiera frontend).
+      - name: "ZAP Baseline Scan (sin autenticacion)"
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: ${{ env.BACKEND_URL }}
+          rules_file_name: ".github/zap/zap-rules.tsv"
+          allow_issue_writing: false
+          fail_action: false
+          cmd_options: "-a"
+
+      - name: "Subir reporte baseline"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-baseline-report-${{ github.run_number }}
+          path: |
+            report_html.html
+            report_json.json
+
+
+  # ============================================================
+  # JOB 2: ESCANEO ACTIVO (Full Scan con autenticacion JWT)
+  # Se ejecuta en push a main y en el cron semanal.
+  # Obtiene un JWT real y lo inyecta en cada peticion de ZAP.
+  # Detecta: SQL Injection, XSS, Broken Access Control,
+  #          IDOR, endpoints sin proteger, configuracion insegura.
+  # ============================================================
+  zap-active:
+    name: "ZAP Active Scan (autenticado con JWT)"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'schedule'
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: tecsup_security
+          POSTGRES_USER: tecsup
+          POSTGRES_PASSWORD: tecsup123
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Configurar Java 17"
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+          cache: maven
+
+      - name: "Compilar backend (sin tests)"
+        working-directory: security
+        run: mvn -B -q package -DskipTests
+
+      - name: "Iniciar backend Spring Boot"
+        working-directory: security
+        run: |
+          java -jar target/security-1.0.0.jar \
+            --spring.datasource.url=jdbc:postgresql://localhost:5433/tecsup_security \
+            --spring.datasource.username=tecsup \
+            --spring.datasource.password=tecsup123 \
+            > /tmp/backend.log 2>&1 &
+          echo $! > /tmp/backend.pid
+
+      - name: "Esperar que el backend responda"
+        run: |
+          for i in $(seq 1 30); do
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" "$BACKEND_URL/v3/api-docs" || echo "000")
+            if [ "$HTTP" != "000" ]; then
+              echo "Backend listo – HTTP $HTTP"
+              exit 0
+            fi
+            echo "  Intento $i/30..."
+            sleep 3
+          done
+          cat /tmp/backend.log
+          exit 1
+
+      # Llama al endpoint de login real con las credenciales de prueba.
+      # Extrae el JWT de la respuesta JSON y lo guarda como variable de entorno.
+      - name: "Obtener token JWT (usuario admin)"
+        id: auth
+        run: |
+          echo "Autenticando como '$ZAP_TEST_USER' en $BACKEND_URL/api/auth/login ..."
+
+          RESPONSE=$(curl -s -X POST "$BACKEND_URL/api/auth/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"$ZAP_TEST_USER\",\"password\":\"$ZAP_TEST_PASS\"}")
+
+          # Busca los campos mas comunes para el token JWT en la respuesta
+          TOKEN=$(echo "$RESPONSE" | python3 -c "
+          import sys, json
+          try:
+              d = json.load(sys.stdin)
+              print(d.get('token') or d.get('accessToken') or d.get('jwt') or '')
+          except:
+              print('')
+          ")
+
+          if [ -z "$TOKEN" ]; then
+            echo "ERROR: No se obtuvo JWT. Respuesta del servidor:"
+            echo "$RESPONSE"
+            exit 1
+          fi
+
+          echo "JWT obtenido: ${TOKEN:0:25}... [truncado por seguridad]"
+          # Exponer el token al siguiente paso via env (no como output para evitar logs)
+          echo "ZAP_JWT_TOKEN=$TOKEN" >> $GITHUB_ENV
+
+      # Prepara el directorio de trabajo que se montara en el contenedor ZAP.
+      # ZAP Docker escribe los reportes en /zap/wrk/ dentro del contenedor.
+      - name: "Preparar directorio de trabajo ZAP"
+        run: mkdir -p "${{ github.workspace }}/zap-reports"
+
+      # Ejecuta ZAP en Docker con:
+      #   --network host    → ZAP puede acceder a localhost:8080
+      #   -e ZAP_JWT_TOKEN  → el hook Python lee esta variable
+      #   -v conf/:ro       → reglas + hook script (solo lectura)
+      #   -v reports/:rw    → ZAP escribe los reportes aqui
+      #   -I                → ignora errores para no bloquear el pipeline
+      #   -l WARN           → reporta desde nivel WARN para arriba
+      - name: "ZAP Full Scan (activo, con JWT)"
+        run: |
+          docker run --rm \
+            --network host \
+            -e ZAP_JWT_TOKEN="${ZAP_JWT_TOKEN}" \
+            -v "${{ github.workspace }}/.github/zap:/zap/conf/:ro" \
+            -v "${{ github.workspace }}/zap-reports:/zap/wrk/:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py \
+              -t "$BACKEND_URL" \
+              -r zap-active-report.html \
+              -J zap-active-report.json \
+              -c /zap/conf/zap-rules.tsv \
+              -l WARN \
+              -I \
+              --hook=/zap/conf/add-auth-header.py
+
+      # Parsea el JSON de ZAP para contar alertas por severidad
+      # y mostrar un resumen en el log de CI.
+      - name: "Resumen de hallazgos DAST"
+        if: always()
+        run: |
+          REPORT="${{ github.workspace }}/zap-reports/zap-active-report.json"
+          if [ ! -f "$REPORT" ]; then
+            echo "Reporte JSON no encontrado, revisa el paso anterior."
+            exit 0
+          fi
+
+          python3 - <<'EOF'
+          import json, sys
+
+          RIESGO = {3: "HIGH", 2: "MEDIUM", 1: "LOW", 0: "INFORMATIONAL"}
+          COLORES = {3: "\033[31m", 2: "\033[33m", 1: "\033[36m", 0: "\033[37m"}
+          RESET = "\033[0m"
+
+          with open("/home/runner/work/_temp/../../../zap-reports/zap-active-report.json") as f:
+              pass  # placeholder - se lee desde la ruta correcta abajo
+          EOF
+
+          python3 -c "
+          import json
+
+          with open('$REPORT') as f:
+              data = json.load(f)
+
+          counts = {3: 0, 2: 0, 1: 0, 0: 0}
+          labels = {3: 'HIGH', 2: 'MEDIUM', 1: 'LOW', 0: 'INFO'}
+          alerts_found = []
+
+          for site in data.get('site', []):
+              for alert in site.get('alerts', []):
+                  risk = int(alert.get('riskcode', 0))
+                  counts[risk] = counts.get(risk, 0) + 1
+                  if risk >= 2:
+                      alerts_found.append(f\"  [{labels[risk]}] {alert.get('name','?')} – {alert.get('solution','')[:80]}\")
+
+          print('=== RESUMEN DAST ZAP ===')
+          for r in sorted(counts.keys(), reverse=True):
+              print(f\"  {labels[r]:12} : {counts[r]} alerta(s)\")
+
+          if alerts_found:
+              print()
+              print('Alertas de riesgo MEDIUM o superior:')
+              for a in alerts_found:
+                  print(a)
+          "
+
+      - name: "Subir reporte active scan"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-active-report-${{ github.run_number }}
+          path: zap-reports/
